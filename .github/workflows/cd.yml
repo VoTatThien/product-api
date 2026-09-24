@@ -3,14 +3,7 @@ name: Product API - CD Pipeline (Docker Hub)
 on:
   push:
     branches: [main]
-    # Only trigger CD when CI-relevant files change
-    paths:
-      - "**.js"
-      - "package*.json"
-      - "Dockerfile"
-      - "docker-compose*.yml"
-      - "docker-compose*.yaml"
-      - ".github/workflows/**"
+  workflow_dispatch:
 
 env:
   DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/product-api
