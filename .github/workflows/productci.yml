@@ -1,0 +1,91 @@
+name: Product API - CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Lint, Build & Test
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 30s
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        env:
+          NODE_ENV: test
+          MONGO_URI: mongodb://localhost:27017/productdb_test
+        run: npm test
+
+      - name: Build Docker image
+        run: docker build -t product-api:test .
+
+      - name: Run Docker container for healthcheck
+        run: |
+          docker network create test-network
+
+          docker run -d \
+            --name test-mongo \
+            --network test-network \
+            -p 27018:27017 \
+            mongo:7
+
+          sleep 10
+
+          docker run -d \
+            --name test-product-api \
+            --network test-network \
+            -p 3001:3000 \
+            -e PORT=3000 \
+            -e MONGO_URI=mongodb://test-mongo:27017/productdb_test \
+            product-api:test
+
+          sleep 10
+
+      - name: Verify API healthcheck
+        run: |
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/health || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Healthcheck passed!"
+              curl -s http://localhost:3001/health | jq .
+              exit 0
+            fi
+            echo "⏳ Attempt $i: API not ready (HTTP $STATUS), waiting..."
+            sleep 5
+          done
+          echo "❌ Healthcheck failed after 10 attempts"
+          docker logs test-product-api
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop test-product-api test-mongo || true
+          docker rm test-product-api test-mongo || true
+          docker network rm test-network || true

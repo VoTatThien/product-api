@@ -1,0 +1,195 @@
+name: Product API - CD Pipeline (Docker Hub)
+
+on:
+  push:
+    branches: [main]
+    # Only trigger CD when CI-relevant files change
+    paths:
+      - "**.js"
+      - "package*.json"
+      - "Dockerfile"
+      - "docker-compose*.yml"
+      - "docker-compose*.yaml"
+      - ".github/workflows/**"
+
+env:
+  DOCKERHUB_REPO: ${{ secrets.DOCKERHUB_USERNAME }}/product-api
+
+jobs:
+  # ==================== CI: Test & Healthcheck ====================
+  ci:
+    name: CI - Test & Healthcheck
+    runs-on: ubuntu-latest
+
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.adminCommand(\"ping\")'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+          --health-start-period 30s
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run CRUD tests
+        env:
+          NODE_ENV: test
+          MONGO_URI: mongodb://localhost:27017/productdb_test
+        run: npm test
+
+      - name: Build Docker image for healthcheck
+        run: docker build -t product-api:ci-test .
+
+      - name: Run containers for healthcheck verification
+        run: |
+          docker network create ci-network
+
+          docker run -d \
+            --name ci-mongo \
+            --network ci-network \
+            mongo:7
+
+          sleep 10
+
+          docker run -d \
+            --name ci-product-api \
+            --network ci-network \
+            -p 3001:3000 \
+            -e PORT=3000 \
+            -e MONGO_URI=mongodb://ci-mongo:27017/productdb_test \
+            product-api:ci-test
+
+          sleep 10
+
+      - name: Verify API healthcheck
+        run: |
+          for i in $(seq 1 10); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3001/health || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Healthcheck passed!"
+              curl -s http://localhost:3001/health | jq .
+              exit 0
+            fi
+            echo "⏳ Attempt $i: API not ready (HTTP $STATUS), waiting..."
+            sleep 5
+          done
+          echo "❌ Healthcheck failed!"
+          docker logs ci-product-api
+          exit 1
+
+      - name: Cleanup CI containers
+        if: always()
+        run: |
+          docker stop ci-product-api ci-mongo || true
+          docker rm ci-product-api ci-mongo || true
+          docker network rm ci-network || true
+
+  # ==================== CD: Build & Push to Docker Hub ====================
+  cd:
+    name: CD - Push to Docker Hub
+    runs-on: ubuntu-latest
+    needs: ci
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.DOCKERHUB_REPO }}
+          tags: |
+            type=raw,value=latest
+            type=sha,prefix=
+            type=ref,event=branch
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Verify pushed image
+        run: |
+          echo "✅ Image pushed to Docker Hub:"
+          echo "   ${{ env.DOCKERHUB_REPO }}:latest"
+          echo ""
+          echo "🚀 To deploy on local Docker Engine, run:"
+          echo "   docker compose -f docker-compose-prod.yaml pull"
+          echo "   docker compose -f docker-compose-prod.yaml up -d"
+
+  # ==================== Deploy: Pull & Run on Local (Self-hosted) ====================
+  deploy-local:
+    name: Deploy to Local Docker Engine
+    runs-on: self-hosted
+    needs: cd
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+
+      - name: Pull latest image from Docker Hub
+        run: docker pull ${{ env.DOCKERHUB_REPO }}:latest
+
+      - name: Stop existing containers
+        run: |
+          docker compose -f docker-compose-prod.yaml down --remove-orphans || true
+
+      - name: Deploy with Docker Compose
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          MONGO_INITDB_ROOT_USERNAME: ${{ secrets.MONGO_USERNAME || 'admin' }}
+          MONGO_INITDB_ROOT_PASSWORD: ${{ secrets.MONGO_PASSWORD || 'admin123' }}
+        run: |
+          docker compose -f docker-compose-prod.yaml up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          echo "⏳ Waiting for services to start..."
+          sleep 15
+          for i in $(seq 1 12); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/health || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Deployment successful! API is healthy."
+              curl -s http://localhost:3000/health | jq .
+              exit 0
+            fi
+            echo "⏳ Attempt $i: Waiting for API... (HTTP $STATUS)"
+            sleep 10
+          done
+          echo "❌ Deployment healthcheck failed!"
+          docker compose -f docker-compose-prod.yaml logs
+          exit 1
